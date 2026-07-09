@@ -11,11 +11,38 @@ Always-on terminal dashboard for:
 - Docker containers grouped by project or Kubernetes
 - listening TCP ports
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SammyLin/AgentDeck/main/install.sh | sh
+```
+
+By default this installs `agentdeck` to `~/.local/bin`. Override the install
+location with `INSTALL_DIR`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SammyLin/AgentDeck/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
 ## Build
 
 ```bash
 cargo build --release
 ```
+
+## Release
+
+Create a version tag to publish installable binaries:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The GitHub Actions release workflow uploads `agentdeck-<os>-<arch>.tar.gz`
+assets. The install script downloads those assets first, then falls back to
+`cargo install --git` if a release asset is not available for the user's
+platform.
 
 ## Run
 
