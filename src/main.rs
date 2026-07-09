@@ -2807,44 +2807,102 @@ fn render_agent_sessions_table(
 }
 
 fn render_agent_remaining_overview(frame: &mut Frame, area: Rect, agents: Option<&Panel>) {
-    let rows = ["claude", "codex"].iter().map(|provider| {
-        let (session_used, weekly_used) = agent_limit_values(agents, provider);
-        let session_left = 100u64.saturating_sub(session_used.min(100));
-        let weekly_left = 100u64.saturating_sub(weekly_used.min(100));
-        let provider_style = if *provider == "codex" {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD)
-        };
-        Row::new(vec![
-            Cell::from((*provider).to_string()).style(provider_style),
-            Cell::from(format!("{}% left", session_left))
-                .style(Style::default().fg(usage_color(session_used))),
-            Cell::from(format!("{}% left", weekly_left))
-                .style(Style::default().fg(usage_color(weekly_used))),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(18),
-            Constraint::Length(18),
-        ],
+    let chunks = split_with_gap(
+        area,
+        Direction::Horizontal,
+        vec![Constraint::Percentage(50), Constraint::Percentage(50)],
+    );
+    render_agent_remaining_card(frame, chunks[0], "claude", agents);
+    render_agent_remaining_card(frame, chunks[1], "codex", agents);
+}
+
+fn usage_left_color(left: u64) -> Color {
+    if left <= 15 {
+        Color::Red
+    } else if left <= 35 {
+        Color::Yellow
+    } else {
+        Color::Blue
+    }
+}
+
+fn remaining_bar(left: u64, width: usize) -> String {
+    let left = left.min(100);
+    let filled = ((left as f64 / 100.0) * width as f64).round() as usize;
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
     )
-    .header(
-        Row::new(vec!["AI", "SESSION", "WEEKLY"]).style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+}
+
+fn render_agent_remaining_card(
+    frame: &mut Frame,
+    area: Rect,
+    provider: &str,
+    agents: Option<&Panel>,
+) {
+    let (session_used, weekly_used) = agent_limit_values(agents, provider);
+    let session_left = 100u64.saturating_sub(session_used.min(100));
+    let weekly_left = 100u64.saturating_sub(weekly_used.min(100));
+    let (icon, label, accent) = if provider == "codex" {
+        ("⬢", "Codex", Color::Cyan)
+    } else {
+        ("◇", "Claude", Color::LightBlue)
+    };
+    let bar_width = area.width.saturating_sub(18).clamp(8, 22) as usize;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                icon,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("S ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                remaining_bar(session_left, bar_width),
+                Style::default().fg(usage_left_color(session_left)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:>3}%", session_left),
+                Style::default()
+                    .fg(usage_left_color(session_left))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("W ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                remaining_bar(weekly_left, bar_width),
+                Style::default().fg(usage_left_color(weekly_left)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:>3}%", weekly_left),
+                Style::default()
+                    .fg(usage_left_color(weekly_left))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent)),
         ),
-    )
-    .block(Block::default().title("Usage Left"));
-    frame.render_widget(table, area);
+        area,
+    );
 }
 
 fn render_agent_visuals(
@@ -2877,7 +2935,7 @@ fn render_agents_dashboard(
     let chunks = split_with_gap(
         inner,
         Direction::Vertical,
-        vec![Constraint::Length(4), Constraint::Min(6)],
+        vec![Constraint::Length(6), Constraint::Min(6)],
     );
     render_agent_remaining_overview(frame, chunks[0], Some(panel));
     let limit = chunks[1].height.saturating_sub(2).max(3) as usize;
