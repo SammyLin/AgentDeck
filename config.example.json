@@ -1,0 +1,52 @@
+{
+  "news": {
+    "rss_urls": [
+      "https://techcrunch.com/category/artificial-intelligence/feed/",
+      "https://venturebeat.com/category/ai/feed/",
+      "https://www.artificialintelligence-news.com/feed/"
+    ],
+    "limit": 8,
+    "translate_to": "Traditional Chinese"
+  },
+  "translation": {
+    "provider": "codex",
+    "model": ""
+  },
+  "weather": {
+    "location": "Taipei",
+    "latitude": 25.033,
+    "longitude": 121.5654,
+    "timezone": "auto"
+  },
+  "calendar": {
+    "lookahead_days": 7,
+    "ics_urls": [
+      "https://example.com/client-calendar.ics"
+    ],
+    "ics_files": []
+  },
+  "agents": {
+    "process_keywords": {
+      "codex": [
+        "codex"
+      ],
+      "claude": [
+        "claude",
+        "claude-code"
+      ]
+    },
+    "status_urls": {
+      "openai": "https://status.openai.com/api/v2/summary.json",
+      "anthropic": "https://status.anthropic.com/api/v2/summary.json"
+    }
+  },
+  "ports": {
+    "limit": 16
+  },
+  "docker": {
+    "limit": 80
+  },
+  "system": {
+    "top_processes": 8
+  }
+}
