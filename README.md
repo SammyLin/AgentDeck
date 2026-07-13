@@ -1,5 +1,12 @@
 # AgentDeck
 
+[![CI](https://github.com/SammyLin/AgentDeck/actions/workflows/ci.yml/badge.svg)](https://github.com/SammyLin/AgentDeck/actions/workflows/ci.yml)
+[![Security audit](https://github.com/SammyLin/AgentDeck/actions/workflows/security.yml/badge.svg)](https://github.com/SammyLin/AgentDeck/actions/workflows/security.yml)
+[![Release](https://github.com/SammyLin/AgentDeck/actions/workflows/release.yml/badge.svg)](https://github.com/SammyLin/AgentDeck/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/SammyLin/AgentDeck)](https://github.com/SammyLin/AgentDeck/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/SammyLin/AgentDeck/total)](https://github.com/SammyLin/AgentDeck/releases)
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282?logo=rust)](https://www.rust-lang.org/)
+
 Always-on terminal dashboard for:
 
 - latest AI news, translated through local Codex by default
@@ -13,8 +20,20 @@ Always-on terminal dashboard for:
 
 ## Install
 
+### One-line installer
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SammyLin/AgentDeck/main/install.sh | sh
+```
+
+The installer downloads the matching GitHub Release archive and verifies its
+published SHA-256 checksum before installing it. Review the script first if you
+do not want to pipe a remote script directly to a shell:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/SammyLin/AgentDeck/main/install.sh
+less install.sh
+sh install.sh
 ```
 
 By default this installs `agentdeck` to `~/.local/bin`. Override the install
@@ -22,6 +41,33 @@ location with `INSTALL_DIR`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SammyLin/AgentDeck/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
+### Cargo
+
+Users who already have Rust installed can build directly from the repository:
+
+```bash
+cargo install --git https://github.com/SammyLin/AgentDeck --locked
+```
+
+## Security
+
+- Release archives are verified with SHA-256 before installation.
+- GitHub generates build provenance attestations for release archives.
+- Every change is tested on Linux and macOS in GitHub Actions.
+- Dependencies are scanned weekly against the RustSec advisory database.
+- Dependabot monitors both Cargo crates and GitHub Actions.
+
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Badges above link to their live results; they are status indicators, not a
+substitute for reviewing the source and installer.
+
+With the GitHub CLI installed, a downloaded release archive can also be checked
+against its build provenance:
+
+```bash
+gh attestation verify agentdeck-<os>-<arch>.tar.gz --repo SammyLin/AgentDeck
 ```
 
 ## Build
@@ -32,9 +78,11 @@ cargo build --release
 
 ## Release
 
-Create a version tag to publish installable binaries:
+Follow the complete [release checklist](RELEASING.md). In short, update the
+version in `Cargo.toml`, run the release check, then create a matching tag:
 
 ```bash
+./scripts/release-check.sh 0.1.0
 git tag v0.1.0
 git push origin v0.1.0
 ```
@@ -60,6 +108,7 @@ Keys:
 
 - `q` or `Esc`: quit
 - `r`: refresh all panels immediately
+- `u`: install an available update, then restart AgentDeck
 - `Tab`: cycle views
 - `1`: Overview
 - `2`: News
@@ -69,6 +118,16 @@ Keys:
 - Mouse click on a tab: switch views
 - Mouse click on a news headline: open the source article
 - Mouse click on a Docker group: expand or collapse containers
+
+AgentDeck checks GitHub Releases in the background at most once every 24 hours.
+When a newer version is available, the header shows an update notice. Updates
+are never installed without confirmation. You can also check or update from the
+command line:
+
+```bash
+agentdeck update --check
+agentdeck update
+```
 
 The default Overview gives the Codex / Claude session and usage panel more
 space, then keeps weather, news, and system health visible. Detailed system,

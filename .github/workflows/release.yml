@@ -6,7 +6,9 @@ on:
       - "v*"
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -17,7 +19,9 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          - ubuntu-24.04-arm
           - macos-latest
+          - macos-15-intel
 
     steps:
       - name: Checkout
@@ -26,8 +30,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        run: cargo build --release --locked
+      - name: Verify tag and package version
+        shell: bash
+        run: ./scripts/release-check.sh "${GITHUB_REF_NAME}"
 
       - name: Package
         shell: bash
@@ -49,6 +54,11 @@ jobs:
           else
             sha256sum "dist/$asset.tar.gz" > "dist/$asset.tar.gz.sha256"
           fi
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2

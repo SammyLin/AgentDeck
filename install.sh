@@ -67,6 +67,23 @@ install_from_release() {
     return 1
   fi
 
+  checksum_url="$url.sha256"
+  echo "Verifying release checksum..."
+  curl -fsSL "$checksum_url" -o "$tmp_dir/agentdeck.tar.gz.sha256"
+  expected="$(awk '{print $1}' "$tmp_dir/agentdeck.tar.gz.sha256")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp_dir/agentdeck.tar.gz" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp_dir/agentdeck.tar.gz" | awk '{print $1}')"
+  else
+    echo "agentdeck installer: sha256sum or shasum is required to verify the download." >&2
+    exit 1
+  fi
+  if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+    echo "agentdeck installer: checksum verification failed; refusing to install." >&2
+    exit 1
+  fi
+
   tar -xzf "$tmp_dir/agentdeck.tar.gz" -C "$tmp_dir"
   mkdir -p "$INSTALL_DIR"
   mv "$tmp_dir/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"

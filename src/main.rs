@@ -26,6 +26,10 @@ use ratatui::{Frame, Terminal};
 
 const APP_NAME: &str = "agentdeck";
 const DISPLAY_NAME: &str = "AgentDeck";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASES_API_URL: &str = "https://api.github.com/repos/SammyLin/AgentDeck/releases/latest";
+const RELEASES_URL: &str = "https://github.com/SammyLin/AgentDeck/releases";
+const UPDATE_CHECK_INTERVAL_SECS: u64 = 86_400;
 
 #[derive(Clone)]
 struct Config {
@@ -125,6 +129,11 @@ struct DashboardHistory {
 #[derive(Default)]
 struct UiState {
     expanded_docker_groups: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct UpdateInfo {
+    version: String,
 }
 
 const NEWS_LINK_PREFIX: &str = "@@link ";
@@ -627,6 +636,165 @@ fn cache_dir() -> PathBuf {
     } else {
         home_file(".cache").join(APP_NAME)
     }
+}
+
+fn update_cache_path() -> PathBuf {
+    cache_dir().join("update-check.txt")
+}
+
+fn normalized_version(version: &str) -> Vec<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split(|ch: char| !ch.is_ascii_digit())
+        .take(3)
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .chain(std::iter::repeat(0))
+        .take(3)
+        .collect()
+}
+
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    normalized_version(candidate) > normalized_version(current)
+}
+
+fn read_cached_update() -> Option<String> {
+    let text = fs::read_to_string(update_cache_path()).ok()?;
+    let mut lines = text.lines();
+    let checked_at = lines.next()?.parse::<u64>().ok()?;
+    if now_secs().saturating_sub(checked_at) >= UPDATE_CHECK_INTERVAL_SECS {
+        return None;
+    }
+    lines
+        .next()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn write_update_cache(version: &str) {
+    let dir = cache_dir();
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(
+            update_cache_path(),
+            format!("{}\n{}\n", now_secs(), version),
+        );
+    }
+}
+
+fn latest_release_version(force: bool) -> Result<String, String> {
+    if !force {
+        if let Some(version) = read_cached_update() {
+            return Ok(version);
+        }
+    }
+    let json = run_command(
+        "curl",
+        &[
+            "-fsSL",
+            "--max-time",
+            "15",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: agentdeck-update-check",
+            RELEASES_API_URL,
+        ],
+        20,
+    )?;
+    let version = json_string(&json, "tag_name")
+        .ok_or_else(|| "latest GitHub release did not contain a tag_name".to_string())?;
+    write_update_cache(&version);
+    Ok(version)
+}
+
+fn available_update(force: bool) -> Result<Option<UpdateInfo>, String> {
+    let version = latest_release_version(force)?;
+    Ok(is_newer_version(&version, VERSION).then_some(UpdateInfo { version }))
+}
+
+fn release_platform() -> Result<&'static str, String> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("macos", "x86_64") => Ok("darwin-x86_64"),
+        ("macos", "aarch64") => Ok("darwin-aarch64"),
+        ("linux", "x86_64") => Ok("linux-x86_64"),
+        ("linux", "aarch64") => Ok("linux-aarch64"),
+        (os, arch) => Err(format!("updates are not available for {}-{}", os, arch)),
+    }
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let value = path.to_string_lossy();
+    let output = if Command::new("sha256sum").arg("--version").output().is_ok() {
+        run_command("sha256sum", &[&value], 20)?
+    } else {
+        run_command("shasum", &["-a", "256", &value], 20)?
+    };
+    output
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| "checksum command returned no digest".to_string())
+}
+
+fn perform_update() -> Result<String, String> {
+    let Some(update) = available_update(true)? else {
+        return Ok(format!("AgentDeck {} is already up to date.", VERSION));
+    };
+    let platform = release_platform()?;
+    let asset = format!("agentdeck-{}.tar.gz", platform);
+    let base = format!("{}/download/{}/{}", RELEASES_URL, update.version, asset);
+    let temp_dir = env::temp_dir().join(format!("agentdeck-update-{}", std::process::id()));
+    let archive = temp_dir.join(&asset);
+    fs::create_dir_all(&temp_dir).map_err(|err| format!("create update directory: {}", err))?;
+    let archive_path = archive.to_string_lossy().to_string();
+    run_command(
+        "curl",
+        &["-fsSL", "--max-time", "120", "-o", &archive_path, &base],
+        125,
+    )?;
+    let checksum = run_command(
+        "curl",
+        &["-fsSL", "--max-time", "30", &format!("{}.sha256", base)],
+        35,
+    )?;
+    let expected = checksum
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "release checksum was empty".to_string())?;
+    let actual = file_sha256(&archive)?;
+    if actual != expected {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err("release checksum verification failed; update aborted".to_string());
+    }
+    let temp_path = temp_dir.to_string_lossy().to_string();
+    run_command("tar", &["-xzf", &archive_path, "-C", &temp_path], 30)?;
+    let downloaded = temp_dir.join(APP_NAME);
+    let current =
+        env::current_exe().map_err(|err| format!("locate current executable: {}", err))?;
+    if current.to_string_lossy().contains("/Cellar/") {
+        return Err("this copy is managed by Homebrew; run `brew upgrade agentdeck`".to_string());
+    }
+    let staged = current.with_file_name(format!(".agentdeck-update-{}", std::process::id()));
+    fs::copy(&downloaded, &staged).map_err(|err| {
+        format!(
+            "cannot write next to {}: {} (try the one-line installer)",
+            current.display(),
+            err
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("set update permissions: {}", err))?;
+    }
+    fs::rename(&staged, &current).map_err(|err| format!("replace current executable: {}", err))?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(format!(
+        "Updated AgentDeck {} -> {}. Restart AgentDeck to use the new version.",
+        VERSION, update.version
+    ))
 }
 
 fn news_cache_path() -> PathBuf {
@@ -3070,8 +3238,8 @@ fn render_system_panel(frame: &mut Frame, area: Rect, panel: &Panel, history: &D
     frame.render_widget(table, chunks[3]);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, config_path: &str) {
-    let line = Line::from(vec![
+fn render_header(frame: &mut Frame, area: Rect, config_path: &str, update: Option<&UpdateInfo>) {
+    let mut spans = vec![
         Span::styled(
             " AgentDeck ",
             Style::default()
@@ -3101,7 +3269,20 @@ fn render_header(frame: &mut Frame, area: Rect, config_path: &str) {
         Span::raw("   "),
         Span::styled("tab/1-5", Style::default().fg(Color::Yellow)),
         Span::styled(" switch", Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+    if let Some(update) = update {
+        spans.extend([
+            Span::raw("   "),
+            Span::styled(
+                format!("{} available", update.version),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · u update", Style::default().fg(Color::Yellow)),
+        ]);
+    }
+    let line = Line::from(spans);
     let header = Paragraph::new(line).alignment(Alignment::Center).block(
         Block::default()
             .borders(Borders::BOTTOM)
@@ -3699,6 +3880,7 @@ fn render_docker_view(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
     panels: &SharedPanels,
@@ -3707,6 +3889,7 @@ fn draw(
     click_zones: &mut Vec<ClickZone>,
     history: &mut DashboardHistory,
     ui_state: &UiState,
+    update: Option<&UpdateInfo>,
 ) {
     click_zones.clear();
     let area = frame.area();
@@ -3719,7 +3902,7 @@ fn draw(
             Constraint::Min(0),
         ])
         .split(area);
-    render_header(frame, root[0], config_path);
+    render_header(frame, root[0], config_path, update);
     render_tabs(frame, root[1], selected_tab);
 
     let body = root[2].inner(Margin {
@@ -3774,6 +3957,15 @@ fn run_once(config: &Config) {
 
 fn run_tui(config: Config, config_path: String) -> io::Result<()> {
     let panels = Arc::new(Mutex::new(new_panels()));
+    let available = Arc::new(Mutex::new(None::<UpdateInfo>));
+    {
+        let available = available.clone();
+        thread::spawn(move || {
+            if let Ok(update) = available_update(false) {
+                *available.lock().unwrap() = update;
+            }
+        });
+    }
     {
         let cfg = config.clone();
         spawn_worker(panels.clone(), "news", config.refresh.news, move || {
@@ -3832,9 +4024,11 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
     let mut click_zones = Vec::<ClickZone>::new();
     let mut history = DashboardHistory::default();
     let mut ui_state = UiState::default();
+    let mut update_requested = false;
 
     let result = loop {
         terminal.draw(|frame| {
+            let update = available.lock().unwrap().clone();
             draw(
                 frame,
                 &panels,
@@ -3843,6 +4037,7 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
                 &mut click_zones,
                 &mut history,
                 &ui_state,
+                update.as_ref(),
             )
         })?;
         if event::poll(Duration::from_millis(250))? {
@@ -3860,6 +4055,10 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
                         let panels = panels.clone();
                         let config = config.clone();
                         thread::spawn(move || refresh_all(&panels, &config));
+                    }
+                    KeyCode::Char('u') if available.lock().unwrap().is_some() => {
+                        update_requested = true;
+                        break Ok(());
                     }
                     _ => {}
                 },
@@ -3900,6 +4099,12 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+    if update_requested {
+        match perform_update() {
+            Ok(message) => println!("{}", message),
+            Err(err) => eprintln!("Update failed: {}", err),
+        }
+    }
     result
 }
 
@@ -4047,6 +4252,14 @@ mod tests {
         assert_eq!(docker_groups_from_panel(&panel)[0].name, "ifrs");
         assert_eq!(docker_containers_from_panel(&panel).len(), 2);
     }
+
+    #[test]
+    fn versions_are_compared_numerically() {
+        assert!(is_newer_version("v0.10.0", "0.9.9"));
+        assert!(is_newer_version("v1.0.1", "1.0.0"));
+        assert!(!is_newer_version("v1.0.0", "1.0.0"));
+        assert!(!is_newer_version("v0.9.9", "1.0.0"));
+    }
 }
 
 fn main() {
@@ -4054,14 +4267,22 @@ fn main() {
     let mut config_path = None;
     let mut once = false;
     let mut print_default_config = false;
+    let mut update = false;
+    let mut check_update = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => config_path = args.next(),
             "--once" => once = true,
             "--print-default-config" => print_default_config = true,
+            "--version" | "-V" => {
+                println!("agentdeck {}", VERSION);
+                return;
+            }
+            "update" => update = true,
+            "--check" if update => check_update = true,
             "-h" | "--help" => {
                 println!(
-                    "{}\n\nUsage:\n  agentdeck [--config config.json] [--once]\n  agentdeck --print-default-config",
+                    "{}\n\nUsage:\n  agentdeck [--config config.json] [--once]\n  agentdeck --print-default-config\n  agentdeck --version\n  agentdeck update [--check]",
                     DISPLAY_NAME
                 );
                 return;
@@ -4074,6 +4295,30 @@ fn main() {
     }
     if print_default_config {
         println!("{}", default_config_json());
+        return;
+    }
+    if update {
+        if check_update {
+            match available_update(true) {
+                Ok(Some(info)) => println!(
+                    "AgentDeck {} is available (current {}).",
+                    info.version, VERSION
+                ),
+                Ok(None) => println!("AgentDeck {} is already up to date.", VERSION),
+                Err(err) => {
+                    eprintln!("Update check failed: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            match perform_update() {
+                Ok(message) => println!("{}", message),
+                Err(err) => {
+                    eprintln!("Update failed: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        }
         return;
     }
     let (config, loaded_path) = load_config(config_path);
