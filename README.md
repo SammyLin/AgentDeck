@@ -114,12 +114,15 @@ Keys:
 - `r`: refresh all panels immediately
 - `u`: install an available update, then restart AgentDeck
 - `Tab`: cycle views
+- `Left` / `Right` or `h` / `l`: move between views
+- `?`: open the in-app keyboard map
 - `1`: Overview
 - `2`: News
 - `3`: Agent
 - `4`: Ops
 - `5`: Docker
 - Mouse click on a tab: switch views
+- Mouse click on an Overview card or priority item: open its detailed view
 - Mouse click on a news headline: open the source article
 - Mouse click on a Docker group: expand or collapse containers
 
@@ -133,10 +136,11 @@ agentdeck update --check
 agentdeck update
 ```
 
-The default Overview gives the Codex / Claude session and usage panel more
-space, then keeps weather, news, and system health visible. Detailed system,
-ports, Docker, and agent data live in their own views so an 80-column terminal
-stays readable.
+The default Overview starts with a severity-sorted priority queue, gives the
+Codex / Claude session and usage panel more space, and keeps weather, the next
+calendar event, news, system health, and local-service health visible. Summary
+cards are shortcuts to their detailed views. Detailed system, ports, Docker,
+and agent data remain readable in an 80-column terminal.
 
 AI news keeps source links clickable without rendering raw URLs. Results are
 cached in `~/.cache/agentdeck/news.txt` and are reused on launch until the

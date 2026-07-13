@@ -23,6 +23,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use unicode_width::UnicodeWidthChar;
 
 const APP_NAME: &str = "agentdeck";
 const DISPLAY_NAME: &str = "AgentDeck";
@@ -102,10 +103,11 @@ struct Panel {
 
 type SharedPanels = Arc<Mutex<BTreeMap<&'static str, Panel>>>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickAction {
     OpenUrl(String),
     ToggleDockerGroup(String),
+    SwitchTab(usize),
 }
 
 #[derive(Clone)]
@@ -136,9 +138,37 @@ struct UpdateInfo {
     version: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttentionItem {
+    label: String,
+    detail: String,
+    tab: usize,
+    critical: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DashboardSummary {
+    active_agents: usize,
+    running_services: usize,
+    total_services: usize,
+    listening_ports: usize,
+    attention: Vec<AttentionItem>,
+}
+
 const NEWS_LINK_PREFIX: &str = "@@link ";
 const TAB_COUNT: usize = 5;
 const HISTORY_LIMIT: usize = 72;
+const TAB_LABELS: [&str; TAB_COUNT] = [
+    "1  OVERVIEW",
+    "2  NEWS + DAY",
+    "3  AGENTS",
+    "4  SYSTEM",
+    "5  SERVICES",
+];
+const COLOR_SIGNAL: Color = Color::Rgb(96, 214, 170);
+const COLOR_CYAN: Color = Color::Rgb(103, 194, 207);
+const COLOR_AMBER: Color = Color::Rgb(232, 171, 92);
+const COLOR_DANGER: Color = Color::Rgb(235, 105, 116);
 
 fn default_config() -> Config {
     Config {
@@ -2365,6 +2395,30 @@ fn is_news_title(line: &str) -> bool {
         && hidden_news_link(line).is_none()
 }
 
+fn wrap_display_line(value: &str, max_width: usize) -> Vec<String> {
+    if value.is_empty() {
+        return vec![String::new()];
+    }
+    let max_width = max_width.max(1);
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in value.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width.saturating_add(width) > max_width {
+            wrapped.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(width);
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
+}
+
 fn render_news_panel(
     frame: &mut Frame,
     area: Rect,
@@ -2376,13 +2430,16 @@ fn render_news_panel(
     let inner = block.inner(area);
     let mut lines = Vec::new();
     let mut visible_row = 0u16;
+    let line_width = inner.width.max(1) as usize;
 
     if let Some(error) = &panel.error {
-        lines.push(Line::styled(
-            format!("ERROR: {}", error),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-        visible_row = visible_row.saturating_add(1);
+        for part in wrap_display_line(&format!("ERROR: {}", error), line_width) {
+            lines.push(Line::styled(
+                part,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+            visible_row = visible_row.saturating_add(1);
+        }
     }
 
     for (index, line) in panel.lines.iter().enumerate() {
@@ -2392,33 +2449,40 @@ fn render_news_panel(
 
         if is_news_title(line) {
             if let Some(link) = line_has_news_link(&panel.lines, index) {
+                let wrapped = wrap_display_line(&format!("{}  [open →]", line), line_width);
                 if visible_row < inner.height {
+                    let available = inner.height.saturating_sub(visible_row);
                     click_zones.push(ClickZone {
                         rect: Rect::new(
                             inner.x,
                             inner.y.saturating_add(visible_row),
                             inner.width,
-                            1,
+                            (wrapped.len() as u16).min(available),
                         ),
                         action: ClickAction::OpenUrl(link),
                     });
                 }
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        line.clone(),
+                for part in wrapped {
+                    lines.push(Line::styled(
+                        part,
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(COLOR_SIGNAL)
                             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    ),
-                    Span::styled(" [open]", Style::default().fg(Color::DarkGray)),
-                ]));
+                    ));
+                    visible_row = visible_row.saturating_add(1);
+                }
             } else {
-                lines.push(Line::styled(line.clone(), line_style(line)));
+                for part in wrap_display_line(line, line_width) {
+                    lines.push(Line::styled(part, line_style(line)));
+                    visible_row = visible_row.saturating_add(1);
+                }
             }
         } else {
-            lines.push(Line::styled(line.clone(), line_style(line)));
+            for part in wrap_display_line(line, line_width) {
+                lines.push(Line::styled(part, line_style(line)));
+                visible_row = visible_row.saturating_add(1);
+            }
         }
-        visible_row = visible_row.saturating_add(1);
     }
 
     if lines.is_empty() {
@@ -2428,9 +2492,7 @@ fn render_news_panel(
         ));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -2712,7 +2774,6 @@ fn trend_line(data: &[u64], max_width: usize) -> String {
 
 fn render_sparkline(frame: &mut Frame, area: Rect, title: &str, data: Vec<u64>, color: Color) {
     let latest = data.last().copied().unwrap_or(0);
-    let min = data.iter().copied().min().unwrap_or(latest);
     let max = data.iter().copied().max().unwrap_or(latest);
     let chart_width = area.width.saturating_sub(2).max(1) as usize;
     let lines = vec![
@@ -2721,7 +2782,7 @@ fn render_sparkline(frame: &mut Frame, area: Rect, title: &str, data: Vec<u64>, 
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            format!("now {:>3}%  min {:>3}%  max {:>3}%", latest, min, max),
+            format!("{:>3}% now · {:>3}% peak", latest, max),
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -3238,52 +3299,231 @@ fn render_system_panel(frame: &mut Frame, area: Rect, panel: &Panel, history: &D
     frame.render_widget(table, chunks[3]);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, config_path: &str, update: Option<&UpdateInfo>) {
-    let mut spans = vec![
+fn attention_items(snapshot: &BTreeMap<&'static str, Panel>) -> Vec<AttentionItem> {
+    let mut items = Vec::new();
+    let panel_tabs = [
+        ("news", 1usize),
+        ("weather", 1),
+        ("calendar", 1),
+        ("agents", 2),
+        ("system", 3),
+        ("ports", 3),
+        ("docker", 4),
+    ];
+    for (key, tab) in panel_tabs {
+        if let Some(panel) = snapshot.get(key) {
+            if let Some(error) = &panel.error {
+                items.push(AttentionItem {
+                    label: panel.title.to_uppercase(),
+                    detail: truncate_chars(error, 58),
+                    tab,
+                    critical: true,
+                });
+            }
+        }
+    }
+
+    let (cpu, memory, disk) = system_percent_values(snapshot.get("system"));
+    for (label, value) in [("CPU pressure", cpu), ("Memory", memory), ("Disk", disk)] {
+        if value >= 85 {
+            items.push(AttentionItem {
+                label: label.to_string(),
+                detail: format!("{}% used · inspect system load", value),
+                tab: 3,
+                critical: value >= 95,
+            });
+        }
+    }
+
+    let (total, running, _) = docker_summary(snapshot.get("docker"));
+    let stopped = total.saturating_sub(running);
+    if stopped > 0 {
+        items.push(AttentionItem {
+            label: "Local services".to_string(),
+            detail: format!("{} of {} containers need review", stopped, total),
+            tab: 4,
+            critical: stopped * 2 >= total.max(1),
+        });
+    }
+
+    for provider in ["codex", "claude"] {
+        let (session, weekly) = agent_limit_values(snapshot.get("agents"), provider);
+        let used = session.max(weekly);
+        if used >= 85 {
+            items.push(AttentionItem {
+                label: format!("{} quota", provider),
+                detail: format!("{}% used · budget the next run", used),
+                tab: 2,
+                critical: used >= 95,
+            });
+        }
+    }
+
+    if let Some(agents) = snapshot.get("agents") {
+        for provider in ["openai", "anthropic"] {
+            let degraded = agents.lines.iter().find(|line| {
+                let lower = line.to_lowercase();
+                lower.starts_with(provider)
+                    && (lower.contains("degraded")
+                        || lower.contains("outage")
+                        || lower.contains("investigating"))
+            });
+            if let Some(line) = degraded {
+                items.push(AttentionItem {
+                    label: format!("{} status", provider),
+                    detail: truncate_chars(line, 58),
+                    tab: 2,
+                    critical: line.to_lowercase().contains("outage"),
+                });
+            }
+        }
+    }
+
+    items.sort_by_key(|item| !item.critical);
+    items
+}
+
+fn dashboard_summary(snapshot: &BTreeMap<&'static str, Panel>) -> DashboardSummary {
+    let active_agents = agent_session_metrics(snapshot.get("agents"), usize::MAX)
+        .iter()
+        .filter(|session| session.state == "working")
+        .count();
+    let (total_services, running_services, _) = docker_summary(snapshot.get("docker"));
+    let listening_ports = snapshot
+        .get("ports")
+        .map(|panel| {
+            panel
+                .lines
+                .iter()
+                .filter(|line| line.starts_with(':') || line.contains("LISTEN"))
+                .count()
+        })
+        .unwrap_or(0);
+    DashboardSummary {
+        active_agents,
+        running_services,
+        total_services,
+        listening_ports,
+        attention: attention_items(snapshot),
+    }
+}
+
+fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    config_path: &str,
+    snapshot: &BTreeMap<&'static str, Panel>,
+    update: Option<&UpdateInfo>,
+) {
+    let summary = dashboard_summary(snapshot);
+    let critical_count = summary
+        .attention
+        .iter()
+        .filter(|item| item.critical)
+        .count();
+    let (health_label, health_color) = if critical_count > 0 {
+        (format!("{} CRITICAL", critical_count), COLOR_DANGER)
+    } else if !summary.attention.is_empty() {
+        (
+            format!("{} TO REVIEW", summary.attention.len()),
+            COLOR_AMBER,
+        )
+    } else {
+        ("ALL CLEAR".to_string(), COLOR_SIGNAL)
+    };
+    let mut top = vec![
         Span::styled(
-            " AgentDeck ",
+            " AGENTDECK ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(COLOR_SIGNAL)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  ● LIVE", Style::default().fg(COLOR_SIGNAL)),
+    ];
+    if area.width < 120 {
+        top.push(Span::styled(
+            format!(
+                "  {} agents · {}/{} svc",
+                summary.active_agents, summary.running_services, summary.total_services
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+    } else {
+        top.push(Span::styled(
+            format!(
+                "  {} active agents  ·  {}/{} services  ·  {} ports",
+                summary.active_agents,
+                summary.running_services,
+                summary.total_services,
+                summary.listening_ports
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    top.extend([
         Span::raw("  "),
+        Span::styled(
+            format!(" {} ", health_label),
+            Style::default()
+                .fg(Color::Black)
+                .bg(health_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    if let Some(update) = update {
+        top.extend([
+            Span::raw("  "),
+            Span::styled(
+                format!("{} READY", update.version),
+                Style::default()
+                    .fg(COLOR_SIGNAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let mut controls = Vec::new();
+    if area.width >= 100 {
+        controls.extend([
+            Span::styled(" CONFIG ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_chars(config_path, area.width.saturating_sub(62) as usize),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::raw("   "),
+        ]);
+    }
+    controls.extend([
         Span::styled(
             "q",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(COLOR_AMBER)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        Span::raw("   "),
+        Span::raw("  "),
         Span::styled(
             "r",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(COLOR_AMBER)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" refresh", Style::default().fg(Color::DarkGray)),
-        Span::raw("   "),
-        Span::styled("config ", Style::default().fg(Color::DarkGray)),
-        Span::styled(config_path.to_string(), Style::default().fg(Color::Gray)),
-        Span::raw("   "),
-        Span::styled("tab/1-5", Style::default().fg(Color::Yellow)),
-        Span::styled(" switch", Style::default().fg(Color::DarkGray)),
-    ];
-    if let Some(update) = update {
-        spans.extend([
-            Span::raw("   "),
-            Span::styled(
-                format!("{} available", update.version),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · u update", Style::default().fg(Color::Yellow)),
+        Span::raw("  "),
+        Span::styled("←/→", Style::default().fg(COLOR_AMBER)),
+        Span::styled(" move", Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled("?", Style::default().fg(COLOR_AMBER)),
+        Span::styled(" keys", Style::default().fg(Color::DarkGray)),
+    ]);
+    if update.is_some() {
+        controls.extend([
+            Span::raw("  "),
+            Span::styled("u", Style::default().fg(COLOR_SIGNAL)),
+            Span::styled(" update", Style::default().fg(Color::DarkGray)),
         ]);
     }
-    let line = Line::from(spans);
-    let header = Paragraph::new(line).alignment(Alignment::Center).block(
+    let header = Paragraph::new(vec![Line::from(top), Line::from(controls)]).block(
         Block::default()
             .borders(Borders::BOTTOM)
             .border_style(Color::DarkGray),
@@ -3291,36 +3531,56 @@ fn render_header(frame: &mut Frame, area: Rect, config_path: &str, update: Optio
     frame.render_widget(header, area);
 }
 
-fn render_tabs(frame: &mut Frame, area: Rect, selected_tab: usize) {
-    let tabs = Tabs::new(["Overview", "News", "Agent", "Ops", "Docker"])
+fn render_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    selected_tab: usize,
+    click_zones: &mut Vec<ClickZone>,
+) {
+    let tabs = Tabs::new(TAB_LABELS)
         .select(selected_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(COLOR_CYAN)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider(Span::styled("  ", Style::default().fg(Color::DarkGray)))
+        .divider(Span::styled("    ", Style::default().fg(Color::DarkGray)))
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(Color::DarkGray),
         );
     frame.render_widget(tabs, area);
+
+    let mut x = area.x;
+    for (tab, label) in TAB_LABELS.iter().enumerate() {
+        let label_width = label.chars().count() as u16;
+        let width = if tab + 1 < TAB_COUNT {
+            label_width.saturating_add(4)
+        } else {
+            area.right().saturating_sub(x)
+        };
+        click_zones.push(ClickZone {
+            rect: Rect::new(x, area.y, width, area.height),
+            action: ClickAction::SwitchTab(tab),
+        });
+        x = x.saturating_add(width);
+    }
 }
 
-fn tab_from_click(column: u16, row: u16) -> Option<usize> {
-    if !(2..=4).contains(&row) {
-        return None;
-    }
-    match column {
-        0..=11 => Some(0),
-        12..=20 => Some(1),
-        21..=31 => Some(2),
-        32..=38 => Some(3),
-        39..=51 => Some(4),
-        _ => None,
-    }
+fn click_action_at(click_zones: &[ClickZone], column: u16, row: u16) -> Option<ClickAction> {
+    click_zones
+        .iter()
+        .rev()
+        .find(|zone| {
+            column >= zone.rect.x
+                && column < zone.rect.x.saturating_add(zone.rect.width)
+                && row >= zone.rect.y
+                && row < zone.rect.y.saturating_add(zone.rect.height)
+        })
+        .map(|zone| zone.action.clone())
 }
 
 fn render_metric_card(
@@ -3330,9 +3590,17 @@ fn render_metric_card(
     value: &str,
     detail: &str,
     accent: Color,
+    destination: usize,
 ) {
     let lines = vec![
-        Line::styled(title.to_string(), Style::default().fg(Color::DarkGray)),
+        Line::from(vec![
+            Span::styled(title.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  →{}", destination + 1),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .alignment(Alignment::Center),
         Line::styled(
             value.to_string(),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
@@ -3349,6 +3617,91 @@ fn render_metric_card(
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
     frame.render_widget(card, area);
+}
+
+fn register_tab_zone(click_zones: &mut Vec<ClickZone>, area: Rect, tab: usize) {
+    click_zones.push(ClickZone {
+        rect: area,
+        action: ClickAction::SwitchTab(tab),
+    });
+}
+
+fn render_attention_panel(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &BTreeMap<&'static str, Panel>,
+    click_zones: &mut Vec<ClickZone>,
+) {
+    let attention = attention_items(snapshot);
+    let critical_count = attention.iter().filter(|item| item.critical).count();
+    let (title, accent) = if critical_count > 0 {
+        (
+            format!(" PRIORITY · {} CRITICAL ", critical_count),
+            COLOR_DANGER,
+        )
+    } else if !attention.is_empty() {
+        (
+            format!(" PRIORITY · {} TO REVIEW ", attention.len()),
+            COLOR_AMBER,
+        )
+    } else {
+        (" STATUS · ALL CLEAR ".to_string(), COLOR_SIGNAL)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .title(Line::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let mut lines = Vec::new();
+    if attention.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(COLOR_SIGNAL)),
+            Span::styled(
+                "No action needed",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  Agents, resources and local services are within healthy thresholds.",
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    } else {
+        for (row, item) in attention.iter().take(inner.height as usize).enumerate() {
+            let color = if item.critical {
+                COLOR_DANGER
+            } else {
+                COLOR_AMBER
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if item.critical { "! " } else { "▲ " },
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<16}", truncate_chars(&item.label, 16)),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(item.detail.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("  OPEN →{}", item.tab + 1),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            click_zones.push(ClickZone {
+                rect: Rect::new(inner.x, inner.y.saturating_add(row as u16), inner.width, 1),
+                action: ClickAction::SwitchTab(item.tab),
+            });
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn panel_line(panel: Option<&Panel>, index: usize) -> String {
@@ -3389,31 +3742,39 @@ fn render_overview(
     let system = snapshot.get("system");
     let docker = snapshot.get("docker");
     let ports = snapshot.get("ports");
+    let calendar = snapshot.get("calendar");
+    let attention_height = attention_items(snapshot).len().clamp(1, 3) as u16 + 2;
 
     if area.width < 100 {
         let vertical = split_with_gap(
             area,
             Direction::Vertical,
             vec![
+                Constraint::Length(attention_height),
                 Constraint::Length(20),
                 Constraint::Length(5),
                 Constraint::Min(10),
             ],
         );
 
+        render_attention_panel(frame, vertical[0], snapshot, click_zones);
+
         if let Some(panel) = agents {
-            render_agents_dashboard(frame, vertical[0], panel, history);
+            render_agents_dashboard(frame, vertical[1], panel, history);
         }
+        register_tab_zone(click_zones, vertical[1], 2);
         render_metric_card(
             frame,
-            vertical[1],
+            vertical[2],
             "WEATHER",
             &panel_line(weather, 0),
             &panel_line(weather, 1),
-            Color::Yellow,
+            COLOR_AMBER,
+            1,
         );
+        register_tab_zone(click_zones, vertical[2], 1);
         if let Some(panel) = snapshot.get("news") {
-            render_news_panel(frame, vertical[2], panel, Color::Green, click_zones);
+            render_news_panel(frame, vertical[3], panel, COLOR_SIGNAL, click_zones);
         }
         return;
     }
@@ -3421,10 +3782,15 @@ fn render_overview(
     let vertical = split_with_gap(
         area,
         Direction::Vertical,
-        vec![Constraint::Length(20), Constraint::Min(10)],
+        vec![
+            Constraint::Length(attention_height),
+            Constraint::Length(20),
+            Constraint::Min(10),
+        ],
     );
+    render_attention_panel(frame, vertical[0], snapshot, click_zones);
     let top = split_with_gap(
-        vertical[0],
+        vertical[1],
         Direction::Horizontal,
         vec![
             Constraint::Percentage(50),
@@ -3436,15 +3802,33 @@ fn render_overview(
     if let Some(panel) = agents {
         render_agents_dashboard(frame, top[0], panel, history);
     }
+    register_tab_zone(click_zones, top[0], 2);
 
+    let day_cards = split_with_gap(
+        top[1],
+        Direction::Vertical,
+        vec![Constraint::Percentage(50), Constraint::Percentage(50)],
+    );
     render_metric_card(
         frame,
-        top[1],
+        day_cards[0],
         "WEATHER",
         &panel_line(weather, 0),
         &panel_line(weather, 1),
-        Color::Yellow,
+        COLOR_AMBER,
+        1,
     );
+    register_tab_zone(click_zones, day_cards[0], 1);
+    render_metric_card(
+        frame,
+        day_cards[1],
+        "NEXT UP",
+        &panel_line(calendar, 0),
+        &panel_line(calendar, 1),
+        COLOR_CYAN,
+        1,
+    );
+    register_tab_zone(click_zones, day_cards[1], 1);
 
     let right_cards = split_with_gap(
         top[2],
@@ -3465,22 +3849,34 @@ fn render_overview(
         "SYSTEM",
         &memory,
         &disk,
-        Color::Magenta,
+        Color::LightMagenta,
+        3,
     );
+    register_tab_zone(click_zones, right_cards[0], 3);
 
     let (docker_total, docker_running, _) = docker_summary(docker);
-    let port_count = ports.map(|panel| panel.lines.len()).unwrap_or(0);
+    let port_count = ports
+        .map(|panel| {
+            panel
+                .lines
+                .iter()
+                .filter(|line| line.starts_with(':') || line.contains("LISTEN"))
+                .count()
+        })
+        .unwrap_or(0);
     render_metric_card(
         frame,
         right_cards[1],
         "LOCAL SERVICES",
         &format!("{} / {} containers", docker_running, docker_total),
         &format!("{} listening ports", port_count),
-        Color::LightRed,
+        COLOR_DANGER,
+        4,
     );
+    register_tab_zone(click_zones, right_cards[1], 4);
 
     let content = split_with_gap(
-        vertical[1],
+        vertical[2],
         Direction::Horizontal,
         vec![Constraint::Percentage(58), Constraint::Percentage(42)],
     );
@@ -3880,6 +4276,67 @@ fn render_docker_view(
     }
 }
 
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect, update_available: bool) {
+    let popup = centered_rect(area, 72, if update_available { 17 } else { 16 });
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::styled(
+            "MOVE",
+            Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Line::from("  1–5              Jump directly to a workspace"),
+        Line::from("  Tab / Shift+Tab  Move to next / previous workspace"),
+        Line::from("  ← / → or h / l   Move left / right"),
+        Line::from(""),
+        Line::styled(
+            "ACT",
+            Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Line::from("  Click             Open cards, alerts, news and service groups"),
+        Line::from("  r                 Refresh every data source now"),
+    ];
+    if update_available {
+        lines.push(Line::from(
+            "  u                 Install the available update",
+        ));
+    }
+    lines.extend([
+        Line::from("  ?                 Close this keyboard map"),
+        Line::from("  q / Esc           Quit AgentDeck"),
+        Line::from(""),
+        Line::styled(
+            "Tip: priority rows are severity-sorted shortcuts.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let panel = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(COLOR_CYAN))
+            .title(Line::styled(
+                " KEYBOARD MAP · ? TO CLOSE ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(COLOR_CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )),
+    );
+    frame.render_widget(panel, popup);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
@@ -3890,6 +4347,7 @@ fn draw(
     history: &mut DashboardHistory,
     ui_state: &UiState,
     update: Option<&UpdateInfo>,
+    show_help: bool,
 ) {
     click_zones.clear();
     let area = frame.area();
@@ -3897,19 +4355,19 @@ fn draw(
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(area);
-    render_header(frame, root[0], config_path, update);
-    render_tabs(frame, root[1], selected_tab);
+    let snapshot = panels.lock().unwrap().clone();
+    render_header(frame, root[0], config_path, &snapshot, update);
+    render_tabs(frame, root[1], selected_tab, click_zones);
 
     let body = root[2].inner(Margin {
         vertical: 1,
         horizontal: 1,
     });
-    let snapshot = panels.lock().unwrap().clone();
     sample_history(history, &snapshot);
 
     match selected_tab {
@@ -3918,6 +4376,9 @@ fn draw(
         2 => render_agents_view(frame, body, &snapshot, history),
         3 => render_ops_view(frame, body, &snapshot, history),
         _ => render_docker_view(frame, body, &snapshot, ui_state, click_zones),
+    }
+    if show_help {
+        render_help_overlay(frame, area, update.is_some());
     }
 }
 
@@ -4025,6 +4486,8 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
     let mut history = DashboardHistory::default();
     let mut ui_state = UiState::default();
     let mut update_requested = false;
+    let mut show_help = false;
+    let mut last_mouse_action_at = None::<Instant>;
 
     let result = loop {
         terminal.draw(|frame| {
@@ -4038,14 +4501,23 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
                 &mut history,
                 &ui_state,
                 update.as_ref(),
+                show_help,
             )
         })?;
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
+                    KeyCode::Char('?') => show_help = !show_help,
+                    KeyCode::Esc if show_help => show_help = false,
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Tab => selected_tab = (selected_tab + 1) % TAB_COUNT,
                     KeyCode::BackTab => selected_tab = (selected_tab + TAB_COUNT - 1) % TAB_COUNT,
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        selected_tab = (selected_tab + 1) % TAB_COUNT
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        selected_tab = (selected_tab + TAB_COUNT - 1) % TAB_COUNT
+                    }
                     KeyCode::Char('1') => selected_tab = 0,
                     KeyCode::Char('2') => selected_tab = 1,
                     KeyCode::Char('3') => selected_tab = 2,
@@ -4062,28 +4534,32 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
                     }
                     _ => {}
                 },
-                Event::Mouse(mouse) => {
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        let action = click_zones
-                            .iter()
-                            .find(|zone| {
-                                mouse.column >= zone.rect.x
-                                    && mouse.column < zone.rect.x.saturating_add(zone.rect.width)
-                                    && mouse.row >= zone.rect.y
-                                    && mouse.row < zone.rect.y.saturating_add(zone.rect.height)
-                            })
-                            .map(|zone| zone.action.clone());
+                Event::Mouse(mouse) if !show_help => {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    ) {
+                        let action = click_action_at(&click_zones, mouse.column, mouse.row);
                         if let Some(action) = action {
+                            let duplicate =
+                                matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                                    && last_mouse_action_at.is_some_and(|instant| {
+                                        instant.elapsed() < Duration::from_millis(500)
+                                    });
+                            if duplicate {
+                                continue;
+                            }
+                            last_mouse_action_at = Some(Instant::now());
                             match action {
                                 ClickAction::OpenUrl(url) => open_url(&url),
+                                ClickAction::SwitchTab(tab) => selected_tab = tab,
                                 ClickAction::ToggleDockerGroup(group) => {
                                     if !ui_state.expanded_docker_groups.insert(group.clone()) {
                                         ui_state.expanded_docker_groups.remove(&group);
                                     }
                                 }
                             }
-                        } else if let Some(tab) = tab_from_click(mouse.column, mouse.row) {
-                            selected_tab = tab;
                         }
                     }
                 }
@@ -4191,6 +4667,82 @@ mod tests {
     }
 
     #[test]
+    fn display_wrapping_accounts_for_wide_cjk_characters() {
+        assert_eq!(wrap_display_line("AI 中文", 4), vec!["AI ", "中文"]);
+        assert_eq!(wrap_display_line("", 4), vec![""]);
+    }
+
+    #[test]
+    fn wrapped_news_titles_keep_every_visual_row_clickable() {
+        let backend = ratatui::backend::TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let panel = test_panel(&[
+            "這是一個很長而且會自動換行的新聞標題",
+            "@@link https://example.com/first",
+            "  example.com | now",
+            "Second headline",
+            "@@link https://example.com/second",
+        ]);
+        let mut click_zones = Vec::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_news_panel(frame, area, &panel, COLOR_SIGNAL, &mut click_zones);
+            })
+            .unwrap();
+
+        assert_eq!(click_zones.len(), 2);
+        assert!(click_zones[0].rect.height > 1);
+        assert!(click_zones[1].rect.y > click_zones[0].rect.y);
+        let continuation_row = click_zones[0].rect.y + click_zones[0].rect.height - 1;
+        assert_eq!(
+            click_action_at(&click_zones, click_zones[0].rect.x, continuation_row),
+            Some(ClickAction::OpenUrl(
+                "https://example.com/first".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn click_hit_testing_prefers_the_topmost_zone() {
+        let zones = vec![
+            ClickZone {
+                rect: Rect::new(1, 1, 10, 4),
+                action: ClickAction::SwitchTab(1),
+            },
+            ClickZone {
+                rect: Rect::new(2, 2, 4, 2),
+                action: ClickAction::SwitchTab(4),
+            },
+        ];
+        assert_eq!(
+            click_action_at(&zones, 3, 2),
+            Some(ClickAction::SwitchTab(4))
+        );
+    }
+
+    #[test]
+    fn services_tab_hit_zone_reaches_the_right_edge() {
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut click_zones = Vec::new();
+        terminal
+            .draw(|frame| {
+                render_tabs(frame, frame.area(), 0, &mut click_zones);
+            })
+            .unwrap();
+
+        assert_eq!(
+            click_action_at(&click_zones, 72, 1),
+            Some(ClickAction::SwitchTab(4))
+        );
+        assert_eq!(
+            click_action_at(&click_zones, 79, 1),
+            Some(ClickAction::SwitchTab(4))
+        );
+    }
+
+    #[test]
     fn append_news_refresh_metadata_replaces_old_values() {
         let config = default_config();
         let lines = append_news_refresh_metadata(
@@ -4251,6 +4803,102 @@ mod tests {
         assert_eq!(docker_summary(Some(&panel)), (2, 1, 1));
         assert_eq!(docker_groups_from_panel(&panel)[0].name, "ifrs");
         assert_eq!(docker_containers_from_panel(&panel).len(), 2);
+    }
+
+    #[test]
+    fn dashboard_summary_surfaces_actionable_health_at_a_glance() {
+        let mut snapshot = new_panels();
+        snapshot.insert(
+            "agents",
+            test_panel(&[
+                "codex limits: 96% 5h, 45% weekly",
+                "agent session: codex id=abc state=working age=10sago tok=2.1M ctx=64K",
+                "agent session: claude id=def state=idle age=2hago tok=1.2M cost=$2.10",
+            ]),
+        );
+        snapshot.insert(
+            "system",
+            test_panel(&[
+                "CPU pressure: 22%",
+                "Memory: 28GB / 32GB (88%)",
+                "Disk /: 20GB free / 500GB (480GB used, 96%)",
+            ]),
+        );
+        snapshot.insert(
+            "docker",
+            test_panel(&["docker summary\t4\t3\t2", "docker group\tapp\t4\t3"]),
+        );
+        snapshot.insert(
+            "ports",
+            test_panel(&[
+                ":3000   node             pid 100 user sammy",
+                ":5432   postgres         pid 101 user sammy",
+            ]),
+        );
+
+        let summary = dashboard_summary(&snapshot);
+        assert_eq!(summary.active_agents, 1);
+        assert_eq!(summary.running_services, 3);
+        assert_eq!(summary.total_services, 4);
+        assert_eq!(summary.listening_ports, 2);
+        assert!(summary
+            .attention
+            .iter()
+            .any(|item| item.label == "codex quota" && item.tab == 2));
+        assert!(summary
+            .attention
+            .iter()
+            .any(|item| item.label == "Disk" && item.critical));
+        assert!(summary.attention.first().is_some_and(|item| item.critical));
+    }
+
+    #[test]
+    fn dashboard_attention_maps_panel_failures_to_the_right_workspace() {
+        let mut snapshot = new_panels();
+        let docker = snapshot.get_mut("docker").unwrap();
+        docker.error = Some("Docker daemon unavailable".to_string());
+
+        let attention = attention_items(&snapshot);
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].label, "DOCKER");
+        assert_eq!(attention[0].tab, 4);
+        assert!(attention[0].critical);
+    }
+
+    #[test]
+    fn overview_renders_at_the_supported_eighty_column_width() {
+        let backend = ratatui::backend::TestBackend::new(80, 55);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let panels = Arc::new(Mutex::new(new_panels()));
+        let mut click_zones = Vec::new();
+        let mut history = DashboardHistory::default();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &panels,
+                    "defaults",
+                    0,
+                    &mut click_zones,
+                    &mut history,
+                    &UiState::default(),
+                    None,
+                    false,
+                )
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("AGENTDECK"));
+        assert!(rendered.contains("STATUS · ALL CLEAR"));
+        assert!(rendered.contains("WEATHER  →2"));
+        assert!(!click_zones.is_empty());
     }
 
     #[test]
