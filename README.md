@@ -18,6 +18,10 @@ Always-on terminal dashboard for:
 - Docker containers grouped by project or Kubernetes
 - listening TCP ports
 
+## Preview
+
+![AgentDeck terminal dashboard showing agent usage, AI news, weather, system health, Docker services, and active sessions](docs/assets/agentdeck-dashboard.png)
+
 ## Install
 
 ### One-line installer
