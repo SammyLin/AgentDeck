@@ -20,7 +20,7 @@ Always-on terminal dashboard for:
 
 ## Preview
 
-![AgentDeck terminal dashboard showing agent usage, AI news, weather, system health, Docker services, and active sessions](docs/assets/agentdeck-dashboard.png)
+![AgentDeck Overview showing live Codex and Claude quota meters, active sessions, translated AI news, weather, local services, and system health](docs/assets/agentdeck-dashboard.png)
 
 ## Install
 
