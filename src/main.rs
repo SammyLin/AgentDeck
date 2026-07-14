@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -155,9 +155,17 @@ struct DashboardSummary {
     attention: Vec<AttentionItem>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AgentLimits {
+    session_used: Option<u64>,
+    weekly_used: Option<u64>,
+}
+
 const NEWS_LINK_PREFIX: &str = "@@link ";
 const TAB_COUNT: usize = 5;
 const HISTORY_LIMIT: usize = 72;
+const AGENT_SERVICE_STATUS_INTERVAL_SECS: u64 = 300;
+const CLAUDE_USAGE_INTERVAL_SECS: u64 = 60;
 const TAB_LABELS: [&str; TAB_COUNT] = [
     "1  OVERVIEW",
     "2  NEWS + DAY",
@@ -176,7 +184,7 @@ fn default_config() -> Config {
             news: 900,
             weather: 900,
             calendar: 300,
-            agents: 60,
+            agents: 5,
             system: 3,
             docker: 8,
             ports: 20,
@@ -268,7 +276,13 @@ fn default_config_json() -> &'static str {
 fn section<'a>(json: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("\"{}\"", name);
     let start = json.find(&needle)?;
-    let brace = json[start..].find('{')? + start;
+    let after_key = start + needle.len();
+    let colon = json[after_key..].find(':')? + after_key + 1;
+    let value = json[colon..].trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+    let brace = json.len() - value.len();
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
@@ -1567,10 +1581,11 @@ fn codex_recent_session_lines(limit: usize) -> Vec<String> {
         .filter_map(|(path, mtime)| {
             let (tokens, context, _, _, _, session) = codex_session_usage(&path)?;
             Some(format!(
-                "agent session: codex id={} state={} age={} tok={} ctx={}",
+                "agent session: codex id={} state={} age={} mtime={} tok={} ctx={}",
                 session,
                 session_state_from_age(mtime),
                 age_label(mtime).replace(' ', ""),
+                mtime,
                 compact_num(tokens as f64),
                 compact_num(context as f64)
             ))
@@ -1625,10 +1640,11 @@ fn claude_recent_session_lines(limit: usize) -> Vec<String> {
                 .take(8)
                 .collect::<String>();
             Some(format!(
-                "agent session: claude id={} state={} age={} tok={} in={} out={} cost=${:.2}",
+                "agent session: claude id={} state={} age={} mtime={} tok={} in={} out={} cost=${:.2}",
                 session,
                 session_state_from_age(mtime),
                 age_label(mtime).replace(' ', ""),
+                mtime,
                 compact_num(tok as f64),
                 compact_num(tok_in as f64),
                 compact_num(tok_out as f64),
@@ -1734,7 +1750,95 @@ fn claude_usage_lines() -> Vec<String> {
     lines
 }
 
-fn collect_agents(config: &Config) -> Result<Vec<String>, String> {
+fn claude_limits_from_usage_json(json: &str) -> AgentLimits {
+    let utilization = |period: &str| {
+        section(json, period)
+            .and_then(|value| json_number(value, "utilization"))
+            .map(|value| value.round().clamp(0.0, 100.0) as u64)
+    };
+    AgentLimits {
+        session_used: utilization("five_hour"),
+        weekly_used: utilization("seven_day"),
+    }
+}
+
+fn claude_oauth_access_token() -> Option<String> {
+    if let Ok(token) = env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !token.trim().is_empty() {
+            return Some(token);
+        }
+    }
+
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let credentials = String::from_utf8(output.stdout).ok()?;
+    let oauth = section(&credentials, "claudeAiOauth")?;
+    json_string(oauth, "accessToken").filter(|token| !token.is_empty())
+}
+
+fn bearer_json(url: &str, token: &str, timeout_secs: u64) -> Option<String> {
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "--fail",
+            "--max-time",
+            &timeout_secs.to_string(),
+            "--header",
+            "@-",
+            "--header",
+            "Content-Type: application/json",
+            url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(format!("Authorization: Bearer {}\n", token).as_bytes())
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn collect_claude_limits() -> Vec<String> {
+    let Some(token) = claude_oauth_access_token() else {
+        return Vec::new();
+    };
+    let Some(json) = bearer_json("https://api.anthropic.com/api/oauth/usage", &token, 8) else {
+        return Vec::new();
+    };
+    let limits = claude_limits_from_usage_json(&json);
+    if limits == AgentLimits::default() {
+        return Vec::new();
+    }
+    let session = limits
+        .session_used
+        .map(|value| format!("{}% 5h", value))
+        .unwrap_or_else(|| "5h unavailable".to_string());
+    let weekly = limits
+        .weekly_used
+        .map(|value| format!("{}% weekly", value))
+        .unwrap_or_else(|| "weekly unavailable".to_string());
+    vec![format!("claude limits: {}, {}", session, weekly)]
+}
+
+fn collect_local_agents(config: &Config) -> Result<Vec<String>, String> {
     let processes = list_processes();
     let mut lines = Vec::new();
     for (label, keywords) in [
@@ -1784,14 +1888,22 @@ fn collect_agents(config: &Config) -> Result<Vec<String>, String> {
             lines.push(line.clone());
         }
     }
-    lines.extend(collect_status_page(
-        "openai",
-        &config.agents.openai_status_url,
-    ));
+    Ok(lines)
+}
+
+fn collect_agent_service_status(config: &Config) -> Vec<String> {
+    let mut lines = collect_status_page("openai", &config.agents.openai_status_url);
     lines.extend(collect_status_page(
         "anthropic",
         &config.agents.anthropic_status_url,
     ));
+    lines
+}
+
+fn collect_agents(config: &Config) -> Result<Vec<String>, String> {
+    let mut lines = collect_local_agents(config)?;
+    lines.extend(collect_claude_limits());
+    lines.extend(collect_agent_service_status(config));
     Ok(lines)
 }
 
@@ -2523,6 +2635,9 @@ fn percent_before_marker(line: &str, marker: &str) -> Option<u64> {
     let marker_pos = line.find(marker)?;
     let prefix = &line[..marker_pos];
     let percent_pos = prefix.rfind('%')?;
+    if !prefix[percent_pos + 1..].trim().is_empty() {
+        return None;
+    }
     let digits = prefix[..percent_pos]
         .chars()
         .rev()
@@ -2534,17 +2649,17 @@ fn percent_before_marker(line: &str, marker: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-fn agent_limit_values(panel: Option<&Panel>, provider: &str) -> (u64, u64) {
+fn agent_limit_values(panel: Option<&Panel>, provider: &str) -> AgentLimits {
     let prefix = format!("{} limits:", provider);
     let Some(line) =
         panel.and_then(|panel| panel.lines.iter().find(|line| line.starts_with(&prefix)))
     else {
-        return (0, 0);
+        return AgentLimits::default();
     };
-    (
-        percent_before_marker(line, "5h").unwrap_or(0).min(100),
-        percent_before_marker(line, "weekly").unwrap_or(0).min(100),
-    )
+    AgentLimits {
+        session_used: percent_before_marker(line, "5h").map(|value| value.min(100)),
+        weekly_used: percent_before_marker(line, "weekly").map(|value| value.min(100)),
+    }
 }
 
 fn parse_compact_value(value: &str) -> Option<f64> {
@@ -2619,10 +2734,17 @@ fn agent_session_metrics(panel: Option<&Panel>, limit: usize) -> Vec<AgentSessio
             let tokens = rest.split_whitespace().collect::<Vec<_>>();
             let provider = tokens.first()?.to_string();
             let id = key_value_token(&tokens, "id").unwrap_or("-").to_string();
-            let state = key_value_token(&tokens, "state")
+            let modified =
+                key_value_token(&tokens, "mtime").and_then(|value| value.parse::<u64>().ok());
+            let state = modified
+                .map(session_state_from_age)
+                .or_else(|| key_value_token(&tokens, "state"))
                 .unwrap_or("idle")
                 .to_string();
-            let age = key_value_token(&tokens, "age").unwrap_or("-").to_string();
+            let age = modified
+                .map(|value| age_label(value).replace(' ', ""))
+                .or_else(|| key_value_token(&tokens, "age").map(str::to_string))
+                .unwrap_or_else(|| "-".to_string());
             let tok = key_value_token(&tokens, "tok").unwrap_or("0").to_string();
             let detail = if provider == "claude" {
                 key_value_token(&tokens, "cost").unwrap_or("").to_string()
@@ -2696,12 +2818,20 @@ fn sample_history(history: &mut DashboardHistory, snapshot: &BTreeMap<&'static s
     push_history(&mut history.memory, memory);
     push_history(&mut history.disk, disk);
 
-    let (codex_5h, codex_weekly) = agent_limit_values(snapshot.get("agents"), "codex");
-    let (claude_5h, claude_weekly) = agent_limit_values(snapshot.get("agents"), "claude");
-    push_history(&mut history.codex_5h, codex_5h);
-    push_history(&mut history.codex_weekly, codex_weekly);
-    push_history(&mut history.claude_5h, claude_5h);
-    push_history(&mut history.claude_weekly, claude_weekly);
+    let codex = agent_limit_values(snapshot.get("agents"), "codex");
+    let claude = agent_limit_values(snapshot.get("agents"), "claude");
+    if let Some(value) = codex.session_used {
+        push_history(&mut history.codex_5h, value);
+    }
+    if let Some(value) = codex.weekly_used {
+        push_history(&mut history.codex_weekly, value);
+    }
+    if let Some(value) = claude.session_used {
+        push_history(&mut history.claude_5h, value);
+    }
+    if let Some(value) = claude.weekly_used {
+        push_history(&mut history.claude_weekly, value);
+    }
 }
 
 fn percent_color(value: u64) -> Color {
@@ -2867,15 +2997,37 @@ fn usage_color(used: u64) -> Color {
     }
 }
 
-fn render_usage_meter(frame: &mut Frame, area: Rect, title: &str, used: u64, reset: &str) {
-    let left = 100u64.saturating_sub(used.min(100));
-    let label = format!("{}% left", left);
-    let gauge = Gauge::default()
-        .block(Block::default().title(format!("{}  {}", title, reset)))
-        .gauge_style(Style::default().fg(usage_color(used)).bg(Color::Black))
-        .label(label)
-        .ratio((left as f64) / 100.0);
-    frame.render_widget(gauge, area);
+fn render_usage_meter(frame: &mut Frame, area: Rect, title: &str, used: Option<u64>, reset: &str) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(21), Constraint::Min(8)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", reset), Style::default().fg(Color::DarkGray)),
+        ])),
+        columns[0],
+    );
+
+    if let Some(used) = used {
+        let left = 100u64.saturating_sub(used.min(100));
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(usage_color(used)).bg(Color::Black))
+            .label(format!("{}% left", left))
+            .ratio((left as f64) / 100.0);
+        frame.render_widget(gauge, columns[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("--  not reported").style(Style::default().fg(Color::DarkGray)),
+            columns[1],
+        );
+    }
 }
 
 fn render_usage_stats(frame: &mut Frame, area: Rect, provider: &str, agents: Option<&Panel>) {
@@ -2949,7 +3101,7 @@ fn render_agent_usage_card(
     });
     frame.render_widget(block, area);
 
-    let (session_used, weekly_used) = agent_limit_values(agents, provider);
+    let limits = agent_limit_values(agents, provider);
     let chunks = split_with_gap(
         inner,
         Direction::Vertical,
@@ -2961,8 +3113,14 @@ fn render_agent_usage_card(
             Constraint::Min(3),
         ],
     );
-    render_usage_meter(frame, chunks[0], "Session", session_used, "rolling 5h");
-    render_usage_meter(frame, chunks[1], "Weekly", weekly_used, "rolling 7d");
+    render_usage_meter(
+        frame,
+        chunks[0],
+        "Session",
+        limits.session_used,
+        "rolling 5h",
+    );
+    render_usage_meter(frame, chunks[1], "Weekly", limits.weekly_used, "rolling 7d");
 
     let extra = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -2976,12 +3134,27 @@ fn render_agent_usage_card(
     ]));
     frame.render_widget(extra, chunks[2]);
 
-    let trend_data = if provider == "codex" {
-        history_data(&history.codex_5h, session_used)
+    let trend_history = if provider == "codex" {
+        &history.codex_5h
     } else {
-        history_data(&history.claude_5h, session_used)
+        &history.claude_5h
     };
-    render_sparkline(frame, chunks[3], "Usage Trend", trend_data, Color::Blue);
+    if trend_history.is_empty() && limits.session_used.is_none() {
+        frame.render_widget(
+            Paragraph::new("No quota samples yet")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().title("Usage Trend")),
+            chunks[3],
+        );
+    } else {
+        render_sparkline(
+            frame,
+            chunks[3],
+            "Usage Trend",
+            history_data(trend_history, limits.session_used.unwrap_or(0)),
+            Color::Blue,
+        );
+    }
     render_usage_stats(frame, chunks[4], provider, agents);
 }
 
@@ -3065,15 +3238,39 @@ fn remaining_bar(left: u64, width: usize) -> String {
     )
 }
 
+fn remaining_limit_line(label: &'static str, used: Option<u64>, width: usize) -> Line<'static> {
+    let Some(used) = used else {
+        return Line::from(vec![
+            Span::styled(format!("{} ", label), Style::default().fg(Color::DarkGray)),
+            Span::styled("·".repeat(width), Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(" --", Style::default().fg(Color::DarkGray)),
+        ]);
+    };
+    let left = 100u64.saturating_sub(used.min(100));
+    Line::from(vec![
+        Span::styled(format!("{} ", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            remaining_bar(left, width),
+            Style::default().fg(usage_left_color(left)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>3}%", left),
+            Style::default()
+                .fg(usage_left_color(left))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
 fn render_agent_remaining_card(
     frame: &mut Frame,
     area: Rect,
     provider: &str,
     agents: Option<&Panel>,
 ) {
-    let (session_used, weekly_used) = agent_limit_values(agents, provider);
-    let session_left = 100u64.saturating_sub(session_used.min(100));
-    let weekly_left = 100u64.saturating_sub(weekly_used.min(100));
+    let limits = agent_limit_values(agents, provider);
     let (icon, label, accent) = if provider == "codex" {
         ("⬢", "Codex", Color::Cyan)
     } else {
@@ -3094,34 +3291,8 @@ fn render_agent_remaining_card(
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("S ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                remaining_bar(session_left, bar_width),
-                Style::default().fg(usage_left_color(session_left)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:>3}%", session_left),
-                Style::default()
-                    .fg(usage_left_color(session_left))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("W ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                remaining_bar(weekly_left, bar_width),
-                Style::default().fg(usage_left_color(weekly_left)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:>3}%", weekly_left),
-                Style::default()
-                    .fg(usage_left_color(weekly_left))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        remaining_limit_line("S", limits.session_used, bar_width),
+        remaining_limit_line("W", limits.weekly_used, bar_width),
     ];
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -3347,9 +3518,12 @@ fn attention_items(snapshot: &BTreeMap<&'static str, Panel>) -> Vec<AttentionIte
     }
 
     for provider in ["codex", "claude"] {
-        let (session, weekly) = agent_limit_values(snapshot.get("agents"), provider);
-        let used = session.max(weekly);
-        if used >= 85 {
+        let limits = agent_limit_values(snapshot.get("agents"), provider);
+        let used = [limits.session_used, limits.weekly_used]
+            .into_iter()
+            .flatten()
+            .max();
+        if let Some(used) = used.filter(|value| *value >= 85) {
             items.push(AttentionItem {
                 label: format!("{} quota", provider),
                 detail: format!("{}% used · budget the next run", used),
@@ -4419,6 +4593,8 @@ fn run_once(config: &Config) {
 fn run_tui(config: Config, config_path: String) -> io::Result<()> {
     let panels = Arc::new(Mutex::new(new_panels()));
     let available = Arc::new(Mutex::new(None::<UpdateInfo>));
+    let agent_service_status = Arc::new(Mutex::new(Vec::<String>::new()));
+    let claude_limits = Arc::new(Mutex::new(Vec::<String>::new()));
     {
         let available = available.clone();
         thread::spawn(move || {
@@ -4453,8 +4629,31 @@ fn run_tui(config: Config, config_path: String) -> io::Result<()> {
     }
     {
         let cfg = config.clone();
+        let status = agent_service_status.clone();
+        thread::spawn(move || loop {
+            let lines = collect_agent_service_status(&cfg);
+            *status.lock().unwrap() = lines;
+            thread::sleep(Duration::from_secs(AGENT_SERVICE_STATUS_INTERVAL_SECS));
+        });
+    }
+    {
+        let limits = claude_limits.clone();
+        thread::spawn(move || loop {
+            let lines = collect_claude_limits();
+            if !lines.is_empty() {
+                *limits.lock().unwrap() = lines;
+            }
+            thread::sleep(Duration::from_secs(CLAUDE_USAGE_INTERVAL_SECS));
+        });
+    }
+    {
+        let cfg = config.clone();
+        let status = agent_service_status.clone();
         spawn_worker(panels.clone(), "agents", config.refresh.agents, move || {
-            collect_agents(&cfg)
+            let mut lines = collect_local_agents(&cfg)?;
+            lines.extend(claude_limits.lock().unwrap().clone());
+            lines.extend(status.lock().unwrap().clone());
+            Ok(lines)
         });
     }
     {
@@ -4639,6 +4838,68 @@ mod tests {
         assert_eq!(sessions[0].detail, "ctx 258.4K");
         assert_eq!(sessions[1].provider, "claude");
         assert_eq!(sessions[1].detail, "$0.98");
+    }
+
+    #[test]
+    fn agent_limits_preserve_unknown_instead_of_claiming_full_quota() {
+        let no_limits = test_panel(&["claude latest: in 20K, out 4K tok"]);
+        assert_eq!(
+            agent_limit_values(Some(&no_limits), "claude"),
+            AgentLimits::default()
+        );
+
+        let partial = test_panel(&["codex limits: 22% 5h, weekly unavailable"]);
+        assert_eq!(
+            agent_limit_values(Some(&partial), "codex"),
+            AgentLimits {
+                session_used: Some(22),
+                weekly_used: None,
+            }
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_is_parsed_into_agent_limits() {
+        let usage = r#"{
+            "five_hour": {"utilization": 4.0, "resets_at": "soon"},
+            "seven_day": {"utilization": 48.4, "resets_at": "later"}
+        }"#;
+        assert_eq!(
+            claude_limits_from_usage_json(usage),
+            AgentLimits {
+                session_used: Some(4),
+                weekly_used: Some(48),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_preserves_missing_periods() {
+        let usage = r#"{"five_hour": null, "seven_day": {"utilization": 61}}"#;
+        assert_eq!(
+            claude_limits_from_usage_json(usage),
+            AgentLimits {
+                session_used: None,
+                weekly_used: Some(61),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_session_age_and_state_are_derived_live_from_mtime() {
+        let modified = now_secs().saturating_sub(61);
+        let panel = test_panel(&[&format!(
+            "agent session: codex id=live state=idle age=9hago mtime={} tok=2.0M ctx=64K",
+            modified
+        )]);
+        let sessions = agent_session_metrics(Some(&panel), 1);
+        assert_eq!(sessions[0].state, "working");
+        assert_eq!(sessions[0].age, "1mago");
+    }
+
+    #[test]
+    fn local_agent_refresh_is_fast_by_default() {
+        assert_eq!(default_config().refresh.agents, 5);
     }
 
     #[test]
