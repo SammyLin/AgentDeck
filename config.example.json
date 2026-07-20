@@ -20,9 +20,9 @@
   },
   "calendar": {
     "lookahead_days": 7,
-    "ics_urls": [
-      "https://example.com/client-calendar.ics"
-    ],
+    "macos_calendar": false,
+    "calendar_names": [],
+    "ics_urls": [],
     "ics_files": []
   },
   "agents": {

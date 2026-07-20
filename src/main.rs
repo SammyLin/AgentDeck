@@ -31,6 +31,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_API_URL: &str = "https://api.github.com/repos/SammyLin/AgentDeck/releases/latest";
 const RELEASES_URL: &str = "https://github.com/SammyLin/AgentDeck/releases";
 const UPDATE_CHECK_INTERVAL_SECS: u64 = 86_400;
+const TODAY_CALENDAR_PREFIX: &str = "@@today ";
 
 #[derive(Clone)]
 struct Config {
@@ -80,6 +81,8 @@ struct WeatherConfig {
 #[derive(Clone)]
 struct CalendarConfig {
     lookahead_days: i64,
+    macos_calendar: bool,
+    calendar_names: Vec<String>,
     ics_urls: Vec<String>,
     ics_files: Vec<String>,
 }
@@ -210,6 +213,8 @@ fn default_config() -> Config {
         },
         calendar: CalendarConfig {
             lookahead_days: 7,
+            macos_calendar: false,
+            calendar_names: Vec::new(),
             ics_urls: Vec::new(),
             ics_files: Vec::new(),
         },
@@ -248,6 +253,8 @@ fn default_config_json() -> &'static str {
   },
   "calendar": {
     "lookahead_days": 7,
+    "macos_calendar": false,
+    "calendar_names": [],
     "ics_urls": [],
     "ics_files": []
   },
@@ -355,6 +362,20 @@ fn json_number(json: &str, key: &str) -> Option<f64> {
     rest.get(..len)?.parse().ok()
 }
 
+fn json_bool(json: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{}\"", key);
+    let start = json.find(&needle)?;
+    let colon = json[start..].find(':')? + start + 1;
+    let rest = json[colon..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn json_string_array(json: &str, key: &str) -> Option<Vec<String>> {
     let needle = format!("\"{}\"", key);
     let start = json.find(&needle)?;
@@ -442,6 +463,12 @@ fn load_config(path: Option<String>) -> (Config, String) {
         if let Some(calendar) = section(&json, "calendar") {
             if let Some(v) = json_number(calendar, "lookahead_days") {
                 config.calendar.lookahead_days = v as i64;
+            }
+            if let Some(v) = json_bool(calendar, "macos_calendar") {
+                config.calendar.macos_calendar = v;
+            }
+            if let Some(v) = json_string_array(calendar, "calendar_names") {
+                config.calendar.calendar_names = v;
             }
             if let Some(v) = json_string_array(calendar, "ics_urls") {
                 config.calendar.ics_urls = v;
@@ -1271,43 +1298,33 @@ fn format_event_time(epoch: i64) -> String {
     epoch.to_string()
 }
 
-fn collect_calendar(config: &Config) -> Result<Vec<String>, String> {
-    let mut text = String::new();
-    for url in &config.calendar.ics_urls {
-        text.push_str(&http_get(url, 12)?);
-        text.push('\n');
-    }
-    for path in &config.calendar.ics_files {
-        text.push_str(&fs::read_to_string(path).map_err(|err| format!("{}: {}", path, err))?);
-        text.push('\n');
-    }
-    if text.trim().is_empty() {
-        return Ok(vec![
-            "No calendar configured.".to_string(),
-            "Add Google/Outlook/private ICS URLs or files in config.json.".to_string(),
-        ]);
-    }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CalendarEvent {
+    start: i64,
+    title: String,
+    location: String,
+}
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let end = now + config.calendar.lookahead_days * 86_400;
-    let mut events = Vec::<(i64, String, String)>::new();
+fn parse_ics_events(text: &str, now: i64, end: i64) -> Vec<CalendarEvent> {
+    let mut events = Vec::new();
     let mut inside = false;
     let mut summary = String::new();
     let mut location = String::new();
     let mut start = None;
-    for line in unfold_ics(&text) {
+    for line in unfold_ics(text) {
         if line == "BEGIN:VEVENT" {
             inside = true;
             summary.clear();
             location.clear();
             start = None;
         } else if line == "END:VEVENT" {
-            if let Some(ts) = start {
-                if ts >= now && ts <= end {
-                    events.push((ts, summary.clone(), location.clone()));
+            if let Some(start) = start {
+                if start >= now && start <= end {
+                    events.push(CalendarEvent {
+                        start,
+                        title: summary.clone(),
+                        location: location.clone(),
+                    });
                 }
             }
             inside = false;
@@ -1323,21 +1340,275 @@ fn collect_calendar(config: &Config) -> Result<Vec<String>, String> {
             }
         }
     }
-    events.sort_by_key(|event| event.0);
-    if events.is_empty() {
-        return Ok(vec!["No upcoming calendar events.".to_string()]);
+    events
+}
+
+fn parse_macos_calendar_events(output: &str) -> Vec<CalendarEvent> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            Some(CalendarEvent {
+                start: fields.next()?.parse().ok()?,
+                title: fields.next()?.to_string(),
+                location: fields.next().unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_calendar(
+    config: &CalendarConfig,
+    now: i64,
+    end: i64,
+) -> Result<Vec<CalendarEvent>, String> {
+    const SCRIPT: &str = r#"
+const DAY_MILLIS = 86400000;
+const RECURRENCE_LOOKBACK_DAYS = 30;
+const WEEKDAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
+function clean(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).replace(/[\t\r\n]+/g, " ");
+}
+
+function parseRule(text) {
+  const rule = {};
+  text.split(";").forEach(function(part) {
+    const separator = part.indexOf("=");
+    if (separator > 0) {
+      rule[part.slice(0, separator)] = part.slice(separator + 1);
     }
-    Ok(events
+  });
+  return rule;
+}
+
+function parseUntil(value) {
+  if (!value) return null;
+  const match = value.match(
+    /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/
+  );
+  if (!match) return null;
+  return Math.floor(Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6])
+  ) / 1000);
+}
+
+function localDayNumber(date) {
+  return Math.floor(Date.UTC(
+    date.getFullYear(),
+    date.getMonth(),
+    date.getDate()
+  ) / DAY_MILLIS);
+}
+
+function startOfWeekNumber(date) {
+  return localDayNumber(date) - date.getDay();
+}
+
+function matchesRecurrenceDay(candidate, firstStart, rule) {
+  const interval = Math.max(1, Number(rule.INTERVAL || "1"));
+  const dayDifference = localDayNumber(candidate) - localDayNumber(firstStart);
+  if (dayDifference < 0) return false;
+
+  const allowedDays = (rule.BYDAY || WEEKDAYS[firstStart.getDay()])
+    .split(",")
+    .map(function(day) { return day.slice(-2); });
+  if (allowedDays.indexOf(WEEKDAYS[candidate.getDay()]) < 0) return false;
+
+  if (rule.FREQ === "DAILY") {
+    return dayDifference % interval === 0;
+  }
+  if (rule.FREQ === "WEEKLY") {
+    const weekDifference =
+      (startOfWeekNumber(candidate) - startOfWeekNumber(firstStart)) / 7;
+    return weekDifference >= 0 && weekDifference % interval === 0;
+  }
+  return false;
+}
+
+function expandRecurringEvent(event, ruleText, startEpoch, endEpoch, rows) {
+  const rule = parseRule(ruleText);
+  if (rule.FREQ !== "DAILY" && rule.FREQ !== "WEEKLY") return;
+
+  const firstStart = event.startDate();
+  const untilEpoch = parseUntil(rule.UNTIL);
+  if (untilEpoch !== null && untilEpoch < startEpoch) return;
+
+  const cursor = new Date(Math.max(
+    firstStart.getTime(),
+    new Date(startEpoch * 1000).setHours(0, 0, 0, 0)
+  ));
+  cursor.setHours(0, 0, 0, 0);
+  const endDate = new Date(endEpoch * 1000);
+
+  while (cursor <= endDate) {
+    const occurrence = new Date(cursor);
+    occurrence.setHours(
+      firstStart.getHours(),
+      firstStart.getMinutes(),
+      firstStart.getSeconds(),
+      0
+    );
+    const occurrenceEpoch = Math.floor(occurrence.getTime() / 1000);
+    if (
+      occurrenceEpoch >= startEpoch &&
+      occurrenceEpoch <= endEpoch &&
+      (untilEpoch === null || occurrenceEpoch <= untilEpoch) &&
+      matchesRecurrenceDay(occurrence, firstStart, rule)
+    ) {
+      rows.push([
+        occurrenceEpoch,
+        clean(event.summary()),
+        clean(event.location())
+      ].join("\t"));
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+}
+
+function run(argv) {
+  const startEpoch = Number(argv[0]);
+  const endEpoch = Number(argv[1]);
+  const startDate = new Date(startEpoch * 1000);
+  const endDate = new Date(endEpoch * 1000);
+  const recurrenceSince = new Date(
+    startDate.getTime() - RECURRENCE_LOOKBACK_DAYS * DAY_MILLIS
+  );
+  const selectedNames = argv.slice(2);
+  const calendarApp = Application("Calendar");
+  const rows = [];
+
+  calendarApp.calendars().forEach(function(calendar) {
+    const calendarName = String(calendar.name());
+    if (selectedNames.length > 0 && selectedNames.indexOf(calendarName) < 0) return;
+
+    const events = calendar.events.whose({
+      _or: [
+        {
+          _and: [
+            {startDate: {_greaterThan: startDate}},
+            {endDate: {_lessThanEquals: endDate}}
+          ]
+        },
+        {
+          _and: [
+            {startDate: {_greaterThan: recurrenceSince}},
+            {recurrence: {_contains: "FREQ="}}
+          ]
+        }
+      ]
+    })();
+    events.forEach(function(event) {
+      const recurrence = clean(event.recurrence());
+      if (recurrence) {
+        expandRecurringEvent(event, recurrence, startEpoch, endEpoch, rows);
+        return;
+      }
+      const start = event.startDate();
+      const epoch = Math.floor(start.getTime() / 1000);
+      rows.push([
+        epoch,
+        clean(event.summary()),
+        clean(event.location())
+      ].join("\t"));
+    });
+  });
+
+  return rows.join("\n");
+}
+"#;
+
+    let mut args = vec![
+        "-l".to_string(),
+        "JavaScript".to_string(),
+        "-e".to_string(),
+        SCRIPT.to_string(),
+        "--".to_string(),
+        now.to_string(),
+        end.to_string(),
+    ];
+    args.extend(config.calendar_names.iter().cloned());
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_command("/usr/bin/osascript", &arg_refs, 45).map_err(|err| {
+        format!(
+            "Calendar.app: {}. Allow AgentDeck calendar access in System Settings > Privacy & Security.",
+            err
+        )
+    })?;
+    Ok(parse_macos_calendar_events(&output))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_macos_calendar(
+    _config: &CalendarConfig,
+    _now: i64,
+    _end: i64,
+) -> Result<Vec<CalendarEvent>, String> {
+    Err("Calendar.app integration is only available on macOS.".to_string())
+}
+
+fn collect_calendar(config: &Config) -> Result<Vec<String>, String> {
+    let mut text = String::new();
+    for url in &config.calendar.ics_urls {
+        text.push_str(&http_get(url, 12)?);
+        text.push('\n');
+    }
+    for path in &config.calendar.ics_files {
+        text.push_str(&fs::read_to_string(path).map_err(|err| format!("{}: {}", path, err))?);
+        text.push('\n');
+    }
+    if text.trim().is_empty() && !config.calendar.macos_calendar {
+        return Ok(vec![
+            "No calendar configured.".to_string(),
+            "Enable macOS Calendar or add ICS URLs/files in config.json.".to_string(),
+        ]);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let end = now + config.calendar.lookahead_days.max(1) * 86_400;
+    let mut events = parse_ics_events(&text, now, end);
+    if config.calendar.macos_calendar {
+        events.extend(collect_macos_calendar(&config.calendar, now, end)?);
+    }
+    events.sort();
+    events.dedup();
+    let today_prefix = format_event_time(now).chars().take(5).collect::<String>();
+    let lines = events
         .into_iter()
-        .take(10)
-        .map(|(ts, title, loc)| {
-            if loc.is_empty() {
-                format!("{} {}", format_event_time(ts), title)
+        .map(|event| {
+            let time = format_event_time(event.start);
+            let title = if event.title.is_empty() {
+                "Untitled event"
             } else {
-                format!("{} {} @ {}", format_event_time(ts), title, loc)
+                &event.title
+            };
+            let line = if event.location.is_empty() {
+                format!("{} {}", time, title)
+            } else {
+                format!("{} {} @ {}", time, title, event.location)
+            };
+            if time.starts_with(&today_prefix) {
+                format!("{}{}", TODAY_CALENDAR_PREFIX, line)
+            } else {
+                line
             }
         })
-        .collect())
+        .take(10)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(vec!["No upcoming calendar events.".to_string()]);
+    }
+    Ok(lines)
 }
 
 #[derive(Clone)]
@@ -2455,6 +2726,10 @@ fn hidden_news_link(line: &str) -> Option<String> {
     None
 }
 
+fn visible_panel_line(line: &str) -> &str {
+    line.strip_prefix(TODAY_CALENDAR_PREFIX).unwrap_or(line)
+}
+
 fn panel_lines(panel: &Panel) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(error) = &panel.error {
@@ -2467,7 +2742,8 @@ fn panel_lines(panel: &Panel) -> Vec<Line<'static>> {
         if hidden_news_link(line).is_some() {
             continue;
         }
-        lines.push(Line::styled(line.clone(), line_style(line)));
+        let visible = visible_panel_line(line);
+        lines.push(Line::styled(visible.to_string(), line_style(visible)));
     }
     if lines.is_empty() {
         lines.push(Line::styled(
@@ -3885,6 +4161,21 @@ fn panel_line(panel: Option<&Panel>, index: usize) -> String {
         .unwrap_or_else(|| "Waiting".to_string())
 }
 
+fn today_calendar_lines(panel: Option<&Panel>) -> Vec<String> {
+    let lines = panel
+        .into_iter()
+        .flat_map(|panel| &panel.lines)
+        .filter_map(|line| line.strip_prefix(TODAY_CALENDAR_PREFIX))
+        .take(2)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec!["今天沒有行程".to_string()]
+    } else {
+        lines
+    }
+}
+
 fn split_with_gap(area: Rect, direction: Direction, constraints: Vec<Constraint>) -> Vec<Rect> {
     let mut expanded = Vec::new();
     for (index, constraint) in constraints.into_iter().enumerate() {
@@ -3917,6 +4208,8 @@ fn render_overview(
     let docker = snapshot.get("docker");
     let ports = snapshot.get("ports");
     let calendar = snapshot.get("calendar");
+    let today_calendar = today_calendar_lines(calendar);
+    let today_calendar_detail = today_calendar.get(1).map(String::as_str).unwrap_or("");
     let attention_height = attention_items(snapshot).len().clamp(1, 3) as u16 + 2;
 
     if area.width < 100 {
@@ -3925,6 +4218,7 @@ fn render_overview(
             Direction::Vertical,
             vec![
                 Constraint::Length(attention_height),
+                Constraint::Length(5),
                 Constraint::Length(20),
                 Constraint::Length(5),
                 Constraint::Min(10),
@@ -3932,23 +4226,33 @@ fn render_overview(
         );
 
         render_attention_panel(frame, vertical[0], snapshot, click_zones);
-
-        if let Some(panel) = agents {
-            render_agents_dashboard(frame, vertical[1], panel, history);
-        }
-        register_tab_zone(click_zones, vertical[1], 2);
         render_metric_card(
             frame,
-            vertical[2],
+            vertical[1],
+            "NEXT UP",
+            &today_calendar[0],
+            today_calendar_detail,
+            COLOR_CYAN,
+            1,
+        );
+        register_tab_zone(click_zones, vertical[1], 1);
+
+        if let Some(panel) = agents {
+            render_agents_dashboard(frame, vertical[2], panel, history);
+        }
+        register_tab_zone(click_zones, vertical[2], 2);
+        render_metric_card(
+            frame,
+            vertical[3],
             "WEATHER",
             &panel_line(weather, 0),
             &panel_line(weather, 1),
             COLOR_AMBER,
             1,
         );
-        register_tab_zone(click_zones, vertical[2], 1);
+        register_tab_zone(click_zones, vertical[3], 1);
         if let Some(panel) = snapshot.get("news") {
-            render_news_panel(frame, vertical[3], panel, COLOR_SIGNAL, click_zones);
+            render_news_panel(frame, vertical[4], panel, COLOR_SIGNAL, click_zones);
         }
         return;
     }
@@ -3958,57 +4262,53 @@ fn render_overview(
         Direction::Vertical,
         vec![
             Constraint::Length(attention_height),
-            Constraint::Length(20),
+            Constraint::Length(5),
+            Constraint::Length(25),
             Constraint::Min(10),
         ],
     );
     render_attention_panel(frame, vertical[0], snapshot, click_zones);
-    let top = split_with_gap(
+    render_metric_card(
+        frame,
         vertical[1],
+        "NEXT UP",
+        &today_calendar[0],
+        today_calendar_detail,
+        COLOR_CYAN,
+        1,
+    );
+    register_tab_zone(click_zones, vertical[1], 1);
+    let dashboard_columns = split_with_gap(
+        vertical[2],
         Direction::Horizontal,
-        vec![
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ],
+        vec![Constraint::Percentage(60), Constraint::Percentage(40)],
     );
 
     if let Some(panel) = agents {
-        render_agents_dashboard(frame, top[0], panel, history);
+        render_agents_dashboard(frame, dashboard_columns[0], panel, history);
     }
-    register_tab_zone(click_zones, top[0], 2);
+    register_tab_zone(click_zones, dashboard_columns[0], 2);
 
-    let day_cards = split_with_gap(
-        top[1],
+    let status_cards = split_with_gap(
+        dashboard_columns[1],
         Direction::Vertical,
-        vec![Constraint::Percentage(50), Constraint::Percentage(50)],
+        vec![
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Min(5),
+        ],
     );
     render_metric_card(
         frame,
-        day_cards[0],
+        status_cards[0],
         "WEATHER",
         &panel_line(weather, 0),
         &panel_line(weather, 1),
         COLOR_AMBER,
         1,
     );
-    register_tab_zone(click_zones, day_cards[0], 1);
-    render_metric_card(
-        frame,
-        day_cards[1],
-        "NEXT UP",
-        &panel_line(calendar, 0),
-        &panel_line(calendar, 1),
-        COLOR_CYAN,
-        1,
-    );
-    register_tab_zone(click_zones, day_cards[1], 1);
+    register_tab_zone(click_zones, status_cards[0], 1);
 
-    let right_cards = split_with_gap(
-        top[2],
-        Direction::Vertical,
-        vec![Constraint::Percentage(50), Constraint::Percentage(50)],
-    );
     let memory = system
         .and_then(|panel| panel.lines.iter().find(|line| line.starts_with("Memory:")))
         .cloned()
@@ -4019,14 +4319,14 @@ fn render_overview(
         .unwrap_or_else(|| "Disk: waiting".to_string());
     render_metric_card(
         frame,
-        right_cards[0],
+        status_cards[1],
         "SYSTEM",
         &memory,
         &disk,
         Color::LightMagenta,
         3,
     );
-    register_tab_zone(click_zones, right_cards[0], 3);
+    register_tab_zone(click_zones, status_cards[1], 3);
 
     let (docker_total, docker_running, _) = docker_summary(docker);
     let port_count = ports
@@ -4040,17 +4340,17 @@ fn render_overview(
         .unwrap_or(0);
     render_metric_card(
         frame,
-        right_cards[1],
+        status_cards[2],
         "LOCAL SERVICES",
         &format!("{} / {} containers", docker_running, docker_total),
         &format!("{} listening ports", port_count),
         COLOR_DANGER,
         4,
     );
-    register_tab_zone(click_zones, right_cards[1], 4);
+    register_tab_zone(click_zones, status_cards[2], 4);
 
     let content = split_with_gap(
-        vertical[2],
+        vertical[3],
         Direction::Horizontal,
         vec![Constraint::Percentage(58), Constraint::Percentage(42)],
     );
@@ -4585,7 +4885,7 @@ fn run_once(config: &Config) {
             if hidden_news_link(line).is_some() {
                 continue;
             }
-            println!("{}", line);
+            println!("{}", visible_panel_line(line));
         }
     }
 }
@@ -4903,6 +5203,59 @@ mod tests {
     }
 
     #[test]
+    fn overview_calendar_uses_today_events_without_waiting() {
+        let panel = test_panel(&[
+            "@@today 07/20 10:00 Daily standup",
+            "07/21 14:00 Weekly sync",
+        ]);
+        assert_eq!(
+            today_calendar_lines(Some(&panel)),
+            vec!["07/20 10:00 Daily standup"]
+        );
+        assert_eq!(
+            today_calendar_lines(Some(&test_panel(&["07/21 14:00 Weekly sync"]))),
+            vec!["今天沒有行程"]
+        );
+    }
+
+    #[test]
+    fn calendar_boolean_config_is_parsed() {
+        assert_eq!(
+            json_bool(r#"{"macos_calendar": true}"#, "macos_calendar"),
+            Some(true)
+        );
+        assert_eq!(
+            json_bool(r#"{"macos_calendar": false}"#, "macos_calendar"),
+            Some(false)
+        );
+        assert_eq!(
+            json_bool(r#"{"macos_calendar": "true"}"#, "macos_calendar"),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_calendar_rows_are_parsed_without_losing_empty_locations() {
+        let events =
+            parse_macos_calendar_events("1784512800\tPlanning\tRoom 2\n1784516400\tFocus time\t");
+        assert_eq!(
+            events,
+            vec![
+                CalendarEvent {
+                    start: 1_784_512_800,
+                    title: "Planning".to_string(),
+                    location: "Room 2".to_string(),
+                },
+                CalendarEvent {
+                    start: 1_784_516_400,
+                    title: "Focus time".to_string(),
+                    location: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn agent_cost_is_parsed_for_usage_card() {
         let panel = test_panel(&["claude 24h: 12 sessions, 4.0M tok, $1947.87"]);
         assert_eq!(agent_24h_tokens(Some(&panel), "claude"), 4_000_000.0);
@@ -5160,6 +5513,83 @@ mod tests {
         assert!(rendered.contains("STATUS · ALL CLEAR"));
         assert!(rendered.contains("WEATHER  →2"));
         assert!(!click_zones.is_empty());
+    }
+
+    #[test]
+    fn overview_places_calendar_between_priority_and_dashboard_cards() {
+        let backend = ratatui::backend::TestBackend::new(120, 55);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let panels = Arc::new(Mutex::new(new_panels()));
+        {
+            let mut panels = panels.lock().unwrap();
+            panels.insert(
+                "calendar",
+                test_panel(&["07/21 10:00 Daily standup", "07/21 14:00 Weekly sync"]),
+            );
+            panels.get_mut("docker").unwrap().error = Some("Docker daemon unavailable".to_string());
+        }
+        let mut click_zones = Vec::new();
+        let mut history = DashboardHistory::default();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &panels,
+                    "defaults",
+                    0,
+                    &mut click_zones,
+                    &mut history,
+                    &UiState::default(),
+                    None,
+                    false,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let priority_row = rows
+            .iter()
+            .position(|row| row.contains("PRIORITY"))
+            .unwrap();
+        let calendar_row = rows.iter().position(|row| row.contains("NEXT UP")).unwrap();
+        let agents_row = rows
+            .iter()
+            .position(|row| row.contains("Codex / Claude"))
+            .unwrap();
+        assert!(priority_row < calendar_row);
+        assert!(calendar_row < agents_row);
+        assert!(click_zones
+            .iter()
+            .any(|zone| { zone.action == ClickAction::SwitchTab(1) && zone.rect.width > 100 }));
+
+        let weather_zone = click_zones
+            .iter()
+            .filter(|zone| zone.action == ClickAction::SwitchTab(1))
+            .max_by_key(|zone| zone.rect.y)
+            .unwrap();
+        let system_zone = click_zones
+            .iter()
+            .filter(|zone| zone.action == ClickAction::SwitchTab(3))
+            .max_by_key(|zone| zone.rect.y)
+            .unwrap();
+        let services_zone = click_zones
+            .iter()
+            .filter(|zone| zone.action == ClickAction::SwitchTab(4))
+            .max_by_key(|zone| zone.rect.y)
+            .unwrap();
+        assert_eq!(weather_zone.rect.x, system_zone.rect.x);
+        assert_eq!(system_zone.rect.x, services_zone.rect.x);
+        assert_eq!(weather_zone.rect.width, system_zone.rect.width);
+        assert_eq!(system_zone.rect.width, services_zone.rect.width);
+        assert!(weather_zone.rect.y < system_zone.rect.y);
+        assert!(system_zone.rect.y < services_zone.rect.y);
     }
 
     #[test]

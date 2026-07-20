@@ -179,9 +179,24 @@ Default translation config:
 Set `model` only if you want to force a specific Codex model. Set `provider`
 to `none` to disable translation, or `openai` to use `OPENAI_API_KEY` directly.
 
-Calendar supports public/private `.ics` URLs, such as Google Calendar secret
-ICS links, or local `.ics` files. Weather uses latitude/longitude so it does not
-need an API key.
+On macOS, Calendar can read events directly from Calendar.app, including
+Google or Outlook calendars already synced there:
+
+```json
+"calendar": {
+  "lookahead_days": 7,
+  "macos_calendar": true,
+  "calendar_names": []
+}
+```
+
+Leave `calendar_names` empty to include every calendar, or list names such as
+`["Work", "Personal"]`. macOS asks for Calendar automation permission the first
+time AgentDeck reads Calendar.app.
+
+Calendar also supports public/private `.ics` URLs, such as Google Calendar
+secret ICS links, or local `.ics` files. Weather uses latitude/longitude so it
+does not need an API key.
 
 ## Notes
 
